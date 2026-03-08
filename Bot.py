@@ -7,7 +7,7 @@ def run():
         page = browser.new_page()
 
         # 1) Abre Class Navi (pon la URL que uses para llegar)
-        page.goto("https://classnavi.kumon.com/")  # cambia si aplica
+        page.goto("https://class-navi.digital.kumon.com/mx/index.html")  # cambia si aplica
         print("1) Loguéate y navega manualmente a Instructor Marking.")
         input("2) Cuando ya estés en la pantalla de marking, presiona ENTER...")
 
@@ -35,4 +35,5 @@ def run():
         browser.close()
 
 if __name__ == "__main__":
+
     run()
