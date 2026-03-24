@@ -6,7 +6,8 @@ import os
 # ════════════════════════════════════
 #  Pon aquí tus credenciales de Mathpix
 # ════════════════════════════════════
-
+MATHPIX_APP_ID = ""
+MATHPIX_APP_KEY = ""
 
 FOLDER = "Prueba"
 
