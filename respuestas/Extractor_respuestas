@@ -1,0 +1,399 @@
+from playwright.sync_api import sync_playwright
+import re
+import json
+
+
+def parse_px(style_value, prop):
+    m = re.search(
+        rf"{prop}:\s*([0-9.]+)px", style_value
+    )
+    return float(m.group(1)) if m else None
+
+
+def parse_scale(style_value):
+    m = re.search(
+        r"scale\(([0-9.]+)\)", style_value
+    )
+    return float(m.group(1)) if m else 1.0
+
+
+def activate_answer_display(page):
+    """
+    Activa el botón de respuestas correctas.
+    Verifica que quede en estado 'disp'.
+    """
+    btn = page.locator("#AnswerDisplayButton")
+    btn.wait_for(state="visible", timeout=5000)
+
+    # Verificar si ya está activado
+    cls = btn.get_attribute("class") or ""
+    if "disp" in cls:
+        print("   ✅ Respuestas ya visibles")
+        return True
+
+    # Activar con JS para evitar canvas overlay
+    page.evaluate(
+        """
+        () => {
+            const btn = document.querySelector(
+                '#AnswerDisplayButton'
+            );
+            if (btn) {
+                btn.click();
+                return true;
+            }
+            return false;
+        }
+        """
+    )
+
+    page.wait_for_timeout(1000)
+
+    # Verificar que se activó
+    cls = btn.get_attribute("class") or ""
+    if "disp" in cls:
+        print("   ✅ Respuestas activadas")
+        return True
+
+    # Segundo intento con dispatch events
+    page.evaluate(
+        """
+        () => {
+            const btn = document.querySelector(
+                '#AnswerDisplayButton'
+            );
+            if (!btn) return false;
+
+            const rect = btn.getBoundingClientRect();
+            const x = rect.left + rect.width / 2;
+            const y = rect.top + rect.height / 2;
+
+            const opts = {
+                bubbles: true,
+                cancelable: true,
+                clientX: x,
+                clientY: y
+            };
+
+            btn.dispatchEvent(
+                new PointerEvent('pointerdown', opts)
+            );
+            btn.dispatchEvent(
+                new MouseEvent('mousedown', opts)
+            );
+            btn.dispatchEvent(
+                new PointerEvent('pointerup', opts)
+            );
+            btn.dispatchEvent(
+                new MouseEvent('mouseup', opts)
+            );
+            btn.dispatchEvent(
+                new MouseEvent('click', opts)
+            );
+
+            return true;
+        }
+        """
+    )
+
+    page.wait_for_timeout(1000)
+
+    cls = btn.get_attribute("class") or ""
+    if "disp" in cls:
+        print("   ✅ Respuestas activadas (2do intento)")
+        return True
+
+    print("   ⚠ No se pudo confirmar activación")
+    return False
+
+
+def deactivate_answer_display(page):
+    """
+    Desactiva las respuestas correctas.
+    """
+    btn = page.locator("#AnswerDisplayButton")
+    cls = btn.get_attribute("class") or ""
+
+    if "disp" not in cls:
+        return True
+
+    page.evaluate(
+        """
+        () => {
+            const btn = document.querySelector(
+                '#AnswerDisplayButton'
+            );
+            if (btn) btn.click();
+        }
+        """
+    )
+
+    page.wait_for_timeout(800)
+    return True
+
+
+def extract_all_answers(page):
+    """
+    Extrae TODOS los div.answer-item del DOM actual.
+    """
+    raw = page.evaluate(
+        """
+        () => {
+            const items = document.querySelectorAll(
+                'div.answer-item'
+            );
+            const results = [];
+
+            items.forEach((el, idx) => {
+                const text = (
+                    el.innerText || el.textContent || ''
+                ).trim();
+
+                if (!text) return;
+
+                const style = el.getAttribute('style') || '';
+
+                const leftM = style.match(
+                    /left:\\s*([0-9.]+)px/
+                );
+                const topM = style.match(
+                    /top:\\s*([0-9.]+)px/
+                );
+                const scaleM = style.match(
+                    /scale\\(([0-9.]+)\\)/
+                );
+
+                const rect = el.getBoundingClientRect();
+
+                results.push({
+                    index: idx,
+                    text: text,
+                    left: leftM
+                        ? parseFloat(leftM[1]) : null,
+                    top: topM
+                        ? parseFloat(topM[1]) : null,
+                    scale: scaleM
+                        ? parseFloat(scaleM[1]) : 1.0,
+                    style: style,
+                    screen_x: Math.round(rect.x),
+                    screen_y: Math.round(rect.y),
+                    screen_w: Math.round(rect.width),
+                    screen_h: Math.round(rect.height),
+                    visible: (
+                        rect.width > 0 &&
+                        rect.height > 0
+                    ),
+                    parent_class: (
+                        el.parentElement
+                            ? el.parentElement.className
+                            : ''
+                    )
+                });
+            });
+
+            return results;
+        }
+        """
+    )
+
+    return raw
+
+
+def extract_mark_boxes(page):
+    """
+    Extrae posiciones de todos los mark-box visibles
+    para poder mapear respuesta → ejercicio.
+    """
+    raw = page.evaluate(
+        """
+        () => {
+            const boxes = document.querySelectorAll(
+                '.mark-box'
+            );
+            const results = [];
+
+            boxes.forEach((el, idx) => {
+                const rect = el.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0)
+                    return;
+
+                const typeDiv = el.querySelector(
+                    '.mark-box-type'
+                );
+                const cls = typeDiv
+                    ? typeDiv.className : '';
+
+                results.push({
+                    index: idx,
+                    screen_x: Math.round(rect.x),
+                    screen_y: Math.round(rect.y),
+                    screen_w: Math.round(rect.width),
+                    screen_h: Math.round(rect.height),
+                    is_checked: cls.includes('check'),
+                    class: cls
+                });
+            });
+
+            return results;
+        }
+        """
+    )
+
+    return raw
+
+
+def match_answers_to_exercises(answers, mark_boxes):
+    """
+    Asocia cada respuesta con el mark-box más
+    cercano verticalmente (mismo ejercicio).
+    """
+    matched = []
+
+    for ans in answers:
+        if not ans["visible"]:
+            continue
+
+        ans_y = ans["screen_y"]
+        best_box = None
+        best_dist = float("inf")
+
+        for box in mark_boxes:
+            # La respuesta debe estar cerca
+            # verticalmente del mark-box
+            dist_y = abs(ans_y - box["screen_y"])
+
+            if dist_y < best_dist:
+                best_dist = dist_y
+                best_box = box
+
+        matched.append({
+            "answer_text": ans["text"],
+            "answer_x": ans["screen_x"],
+            "answer_y": ans["screen_y"],
+            "answer_left": ans["left"],
+            "answer_top": ans["top"],
+            "nearest_box_index": (
+                best_box["index"] if best_box else None
+            ),
+            "nearest_box_y": (
+                best_box["screen_y"] if best_box else None
+            ),
+            "distance_y": round(best_dist, 1),
+            "box_checked": (
+                best_box["is_checked"]
+                if best_box else None
+            )
+        })
+
+    # Ordenar por posición vertical
+    matched.sort(key=lambda m: m["answer_y"])
+
+    return matched
+
+
+def run():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            channel="chrome", headless=False
+        )
+        page = browser.new_page(
+            viewport={"width": 1600, "height": 1000}
+        )
+
+        page.goto(
+            "https://class-navi.digital.kumon.com"
+            "/mx/index.html"
+        )
+
+        print(
+            "1) Loguéate y entra a "
+            "Instructor Marking."
+        )
+        input(
+            "2) Déjalo en una página y "
+            "presiona ENTER..."
+        )
+
+        # ════════════════════════════════
+        #  PASO 1: Activar respuestas
+        # ════════════════════════════════
+        print("\n📝 Activando respuestas correctas...")
+        activate_answer_display(page)
+        page.wait_for_timeout(1000)
+
+        # ════════════════════════════════
+        #  PASO 2: Extraer respuestas
+        # ════════════════════════════════
+        print("\n🔍 Extrayendo respuestas del DOM...")
+        answers = extract_all_answers(page)
+        print(f"   Encontradas: {len(answers)}")
+
+        # ════════════════════════════════
+        #  PASO 3: Extraer mark-boxes
+        # ════════════════════════════════
+        print("\n🔍 Extrayendo mark-boxes...")
+        mark_boxes = extract_mark_boxes(page)
+        print(f"   Encontrados: {len(mark_boxes)}")
+
+        # ════════════════════════════════
+        #  PASO 4: Mapear respuesta → ejercicio
+        # ════════════════════════════════
+        print("\n🔗 Mapeando respuestas a ejercicios...")
+        matched = match_answers_to_exercises(
+            answers, mark_boxes
+        )
+
+        # ════════════════════════════════
+        #  MOSTRAR RESULTADOS
+        # ════════════════════════════════
+        print(f"\n{'='*50}")
+        print("RESPUESTAS CORRECTAS EXTRAÍDAS")
+        print(f"{'='*50}\n")
+
+        for i, m in enumerate(matched):
+            print(
+                f"  [{i+1}] "
+                f"Respuesta: {m['answer_text']:>10} | "
+                f"Pos: ({m['answer_x']}, "
+                f"{m['answer_y']}) | "
+                f"Box #{m['nearest_box_index']} | "
+                f"Dist: {m['distance_y']}px"
+            )
+
+        # ════════════════════════════════
+        #  GUARDAR TODO
+        # ════════════════════════════════
+        output = {
+            "answers_raw": answers,
+            "mark_boxes": mark_boxes,
+            "matched": matched
+        }
+
+        with open(
+            "answers_extracted.json", "w",
+            encoding="utf-8"
+        ) as f:
+            json.dump(
+                output, f, indent=2,
+                ensure_ascii=False
+            )
+
+        print(
+            f"\n📁 Guardado en: answers_extracted.json"
+        )
+        print(f"   Respuestas: {len(answers)}")
+        print(f"   Mark-boxes: {len(mark_boxes)}")
+        print(f"   Mapeadas: {len(matched)}")
+
+        # ════════════════════════════════
+        #  DESACTIVAR RESPUESTAS
+        # ════════════════════════════════
+        print("\n🔄 Desactivando respuestas...")
+        deactivate_answer_display(page)
+
+        input("\nPresiona ENTER para cerrar...")
+        browser.close()
+
+
+if __name__ == "__main__":
+    run()
